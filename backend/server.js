@@ -3,10 +3,10 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
-const Anthropic = require("@anthropic-ai/sdk");
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 const app = express();
-app.use(cors());
+app.use(cors()); // default: reflects request origin, fine for local dev
 app.use(express.json());
 app.use(express.static("public"));
 
@@ -22,12 +22,24 @@ const pool = new Pool({
   password: process.env.PGPASSWORD,
 });
 
-// ---------- Claude ----------
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const MODEL = "claude-sonnet-4-5";
+// ---------- Gemini ----------
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const MODEL = "gemini-3.6-flash";
+
+// Gemini doesn't take a separate "system" argument the way OpenAI/Claude
+// do in this SDK version, so each call below builds one combined prompt
+// and, where needed, asks for JSON output explicitly.
+function extractJson(text) {
+  // Gemini sometimes wraps JSON in ```json ... ``` fences even when asked
+  // not to - strip them before parsing, same idea as clean_json_response
+  // in the Python example.
+  const match = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  const jsonStr = match ? match[1].trim() : text.trim();
+  return JSON.parse(jsonStr);
+}
 
 // ---------- Schema introspection ----------
-// We feed Claude a description of the actual tables/columns so it writes
+// We feed the model a description of the actual tables/columns so it writes
 // SQL against your real schema instead of guessing. Cached for 5 minutes
 // so we're not hitting information_schema on every request.
 let schemaCache = { text: null, fetchedAt: 0 };
@@ -84,7 +96,7 @@ function assertSafeSelect(sql) {
 
 // ---------- Step 1: English -> SQL ----------
 async function generateSql(question, schema) {
-  const system = `You translate a user's question into a single read-only PostgreSQL query.
+  const prompt = `You translate a user's question into a single read-only PostgreSQL query.
 
 Database schema:
 ${schema}
@@ -94,21 +106,20 @@ Rules:
 - "sql" must be one single SELECT (or WITH ... SELECT) statement. Never write INSERT/UPDATE/DELETE/DDL.
 - If the question can't be answered from this schema, set "sql" to null and explain why in "note".
 - Add a LIMIT 200 if the query could return many rows and the user didn't ask for a specific count.
-- Use only tables/columns that appear in the schema above.`;
+- Use only tables/columns that appear in the schema above.
 
-  const response = await anthropic.messages.create({
+User's question: ${question}`;
+
+  const model = genAI.getGenerativeModel({
     model: MODEL,
-    max_tokens: 500,
-    system,
-    messages: [{ role: "user", content: question }],
+    generationConfig: { responseMimeType: "application/json" },
   });
-
-  const text = response.content.find((b) => b.type === "text")?.text || "{}";
-  const cleaned = text.replace(/```json|```/g, "").trim();
+  const result = await model.generateContent(prompt);
+  const text = result.response.text() || "{}";
 
   let parsed;
   try {
-    parsed = JSON.parse(cleaned);
+    parsed = extractJson(text);
   } catch (err) {
     throw new Error(
       "Could not understand how to translate that question into SQL.",
@@ -119,23 +130,18 @@ Rules:
 
 // ---------- Step 2: SQL results -> English ----------
 async function summarizeResults(question, sql, rows) {
-  const system = `You explain database query results to a non-technical user in plain, natural English.
+  const prompt = `You explain database query results to a non-technical user in plain, natural English.
 Be concise and direct. Reference actual numbers/names from the data. Do not mention SQL, tables, or columns by name unless the user did.
-If there are zero rows, say plainly that nothing matched.`;
+If there are zero rows, say plainly that nothing matched.
 
-  const userContent = `Question: ${question}
+Question: ${question}
 SQL that was run: ${sql}
 Result rows (JSON, truncated to first 50): ${JSON.stringify(rows.slice(0, 50))}
 Total rows returned: ${rows.length}`;
 
-  const response = await anthropic.messages.create({
-    model: MODEL,
-    max_tokens: 600,
-    system,
-    messages: [{ role: "user", content: userContent }],
-  });
-
-  return response.content.find((b) => b.type === "text")?.text?.trim() || "";
+  const model = genAI.getGenerativeModel({ model: MODEL });
+  const result = await model.generateContent(prompt);
+  return result.response.text()?.trim() || "";
 }
 
 // ---------- API ----------
