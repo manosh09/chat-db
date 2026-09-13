@@ -142,7 +142,7 @@ Rules:
 - Output ONLY a JSON object, no other text: {{"sql": "...", "note": "..."}}
 - "sql" must be one single SELECT (or WITH ... SELECT) statement. Never write INSERT/UPDATE/DELETE/DDL.
 - If the question can't be answered from this schema, set "sql" to null and explain why in "note".
-- Add a LIMIT 200 if the query could return many rows and the user didn't ask for a specific count.
+- Add a LIMIT 50 if the query could return many rows and the user didn't ask for a specific count.
 - Use only tables/columns that appear in the schema above.
 
 User's question: {question}"""
