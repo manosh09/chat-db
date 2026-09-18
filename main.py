@@ -24,15 +24,10 @@ MODEL = "gemini-3.6-flash"
 
 PORT = int(os.getenv("PORT", 3000))
 
-# ---------- Schema cache ----------
-# We feed the model a description of the actual tables/columns so it writes
-# SQL against the real schema instead of guessing. Cached for 5 minutes so
-# we're not hitting information_schema on every request.
 SCHEMA_TTL_SECONDS = 5 * 60
 schema_cache = {"text": None, "fetched_at": 0.0}
 
 
-# ---------- Lifespan: create/close the Postgres pool with the app ----------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.pool = await asyncpg.create_pool(
@@ -48,7 +43,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Chat with your database", lifespan=lifespan)
 
-# default: reflect all origins, fine for local dev
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -57,7 +51,6 @@ app.add_middleware(
 )
 
 
-# ---------- Request/response models ----------
 class ChatRequest(BaseModel):
     message: str
 
@@ -69,7 +62,6 @@ class ChatResponse(BaseModel):
     rows: list[dict] | None = None
 
 
-# ---------- Schema introspection ----------
 async def get_schema_description(pool: asyncpg.Pool) -> str:
     is_fresh = (
         schema_cache["text"] is not None
@@ -100,10 +92,6 @@ async def get_schema_description(pool: asyncpg.Pool) -> str:
     return text
 
 
-# ---------- Safety check ----------
-# Only ever allow read-only, single-statement queries. This is a
-# defense-in-depth check on top of the read-only DB role - never rely on
-# this alone.
 def assert_safe_select(sql: str) -> str:
     trimmed = re.sub(r";+\s*$", "", sql.strip())
 
@@ -124,34 +112,23 @@ def assert_safe_select(sql: str) -> str:
 
 
 def extract_json(text: str) -> dict:
-    # Gemini sometimes wraps JSON in ```json ... ``` fences even when asked
-    # not to - strip them before parsing.
     match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
     json_str = match.group(1).strip() if match else text.strip()
     return json.loads(json_str)
 
 
-# ---------- Step 1: English -> SQL ----------
 async def generate_sql(question: str, schema: str) -> dict:
     prompt = f"""You translate a user's question into a single read-only PostgreSQL query.
 
 Database schema:
 {schema}
 
-Rules:
-- Output ONLY a JSON object, no other text: {{"sql": "...", "note": "..."}}
-- "sql" must be one single SELECT (or WITH ... SELECT) statement. Never write INSERT/UPDATE/DELETE/DDL.
-- If the question can't be answered from this schema, set "sql" to null and explain why in "note".
-- Add a LIMIT 50 if the query could return many rows and the user didn't ask for a specific count.
-- Use only tables/columns that appear in the schema above.
 
 User's question: {question}"""
 
     model = genai.GenerativeModel(
         MODEL, generation_config={"response_mime_type": "application/json"}
     )
-    # google-generativeai is a sync client - run it off the event loop so
-    # we don't block other requests while waiting on the API.
     response = await run_in_threadpool(model.generate_content, prompt)
     text = response.text or "{}"
 
@@ -163,7 +140,6 @@ User's question: {question}"""
         )
 
 
-# ---------- Step 2: SQL results -> English ----------
 async def summarize_results(question: str, sql: str, rows: list[dict]) -> str:
     prompt = f"""You explain database query results to a non-technical user in plain, natural English.
 Be concise and direct. Reference actual numbers/names from the data. Do not mention SQL, tables, or columns by name unless the user did.
@@ -179,7 +155,6 @@ Total rows returned: {len(rows)}"""
     return (response.text or "").strip()
 
 
-# ---------- API ----------
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     message = req.message
@@ -203,9 +178,6 @@ async def chat(req: ChatRequest):
 
         safe_sql = assert_safe_select(sql)
 
-        # Belt-and-suspenders: run inside an explicitly read-only
-        # transaction with a timeout, even though the role and the regex
-        # check above should already prevent writes and runaway queries.
         async with pool.acquire() as conn:
             async with conn.transaction(readonly=True):
                 await conn.execute("SET LOCAL statement_timeout = '5000'")
@@ -234,8 +206,6 @@ async def health():
     return {"ok": True}
 
 
-# Serve the frontend (public/index.html, style.css, script.js) - mounted
-# last so it doesn't shadow the /api routes above.
 app.mount("/", StaticFiles(directory="public", html=True), name="public")
 
 
