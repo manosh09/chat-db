@@ -20,7 +20,7 @@ if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY not found in environment variables")
 
 genai.configure(api_key=GEMINI_API_KEY)
-MODEL = "gemini-3.6-flash"
+MODEL = "gemini-3.5-flash-lite"
 
 PORT = int(os.getenv("PORT", 3000))
 
@@ -119,6 +119,15 @@ def extract_json(text: str) -> dict:
 
 async def generate_sql(question: str, schema: str) -> dict:
     prompt = f"""You translate a user's question into a single read-only PostgreSQL query.
+
+Rules:
+- Only SELECT (or WITH ... SELECT) queries. Never modify data.
+- Use only the tables and columns listed in the schema.
+- Add LIMIT 100 unless the query is an aggregate (COUNT, AVG, etc.).
+- Respond with ONLY a JSON object in exactly this shape:
+{{"sql": "<the query>", "note": null}}
+- If the question cannot be answered from the schema, respond with:
+{{"sql": null, "note": "<short explanation>"}}
 
 Database schema:
 {schema}
